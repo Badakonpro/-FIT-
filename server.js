@@ -54,11 +54,41 @@ function buildClosedBasePoints(points) {
   return closed;
 }
 
-function computeSamples(allPoints, distances, totalDist, paceSecondsPerKm, hrRestVal, hrMaxVal) {
+// Catmull-Rom 样条插值：在四个控制点间生成一段平滑曲线
+function catmullRomPoint(p0, p1, p2, p3, t) {
+  const t2 = t * t, t3 = t2 * t;
+  return {
+    lat: 0.5 * (2 * p1.lat + (-p0.lat + p2.lat) * t + (2 * p0.lat - 5 * p1.lat + 4 * p2.lat - p3.lat) * t2 + (-p0.lat + 3 * p1.lat - 3 * p2.lat + p3.lat) * t3),
+    lng: 0.5 * (2 * p1.lng + (-p0.lng + p2.lng) * t + (2 * p0.lng - 5 * p1.lng + 4 * p2.lng - p3.lng) * t2 + (-p0.lng + 3 * p1.lng - 3 * p2.lng + p3.lng) * t3)
+  };
+}
+
+// 对路线点做 Catmull-Rom 平滑插值，目标点间距约 targetSpacingMeters 米
+function smoothInterpolatePoints(points, targetSpacingMeters = 3) {
+  if (!points || points.length < 2) return points || [];
+  const n = points.length;
+  const result = [];
+  for (let i = 0; i < n - 1; i++) {
+    const p0 = points[Math.max(0, i - 1)];
+    const p1 = points[i];
+    const p2 = points[i + 1];
+    const p3 = points[Math.min(n - 1, i + 2)];
+    const segLen = haversineDistance(p1.lat, p1.lng, p2.lat, p2.lng);
+    const steps = Math.max(2, Math.round(segLen / targetSpacingMeters));
+    for (let j = 0; j < steps; j++) {
+      result.push(catmullRomPoint(p0, p1, p2, p3, j / steps));
+    }
+  }
+  result.push(points[n - 1]);
+  return result;
+}
+
+function computeSamples(allPoints, distances, totalDist, paceSecondsPerKm, hrRestVal, hrMaxVal, hrRampMinutes) {
   const totalDistanceKm = totalDist / 1000;
   const targetDurationSec = totalDistanceKm * paceSecondsPerKm;
 
   const avgSpeedTarget = totalDist / targetDurationSec;
+  const rampFrac = Math.min(0.75, Math.max(0.01, ((hrRampMinutes || 3) * 60) / targetDurationSec));
   const baseSpeedFactor = 0.98 + Math.random() * 0.06;
   const phase1 = Math.random() * Math.PI * 2;
   const phase2 = Math.random() * Math.PI * 2;
@@ -84,14 +114,15 @@ function computeSamples(allPoints, distances, totalDist, paceSecondsPerKm, hrRes
     );
 
     let intensityBase;
-    if (frac < 0.1) {
-      const f = frac / 0.1;
+    if (frac < rampFrac) {
+      const f = frac / rampFrac;
       intensityBase = 0.4 + 0.4 * f;
-    } else if (frac < 0.8) {
-      const f = (frac - 0.1) / 0.7;
+    } else if (frac < rampFrac + 0.7 * (1 - rampFrac)) {
+      const f = (frac - rampFrac) / (0.7 * (1 - rampFrac));
       intensityBase = 0.8 + 0.05 * Math.sin(f * Math.PI * 2);
     } else {
-      const f = (frac - 0.8) / 0.2;
+      const stableEnd = rampFrac + 0.7 * (1 - rampFrac);
+      const f = (frac - stableEnd) / Math.max(1e-6, 1 - stableEnd);
       intensityBase = 0.85 + 0.1 * f;
     }
 
@@ -101,19 +132,30 @@ function computeSamples(allPoints, distances, totalDist, paceSecondsPerKm, hrRes
     );
 
     const hrTarget = hrRestVal + (hrMaxVal - hrRestVal) * intensity;
-    currentHr += (hrTarget - currentHr) * 0.15;
-    const hrJitter = (Math.random() - 0.5) * 3;
+    currentHr += (hrTarget - currentHr) * 0.08;
+    const hrJitter = (Math.random() - 0.5) * 1.5;
     const hrValue = Math.round(
       Math.min(hrMaxVal, Math.max(hrRestVal, currentHr + hrJitter))
     );
     hrValues[i] = hrValue;
   }
 
+  // 对瞬时速度做移动平均平滑（窗口 5）
+  const smoothWindow = 5;
+  const halfW = Math.floor(smoothWindow / 2);
+  const instSpeedSmoothed = instSpeedRaw.map((_, i) => {
+    let sum = 0, cnt = 0;
+    for (let j = Math.max(0, i - halfW); j <= Math.min(n - 1, i + halfW); j++) {
+      sum += instSpeedRaw[j]; cnt++;
+    }
+    return sum / cnt;
+  });
+
   const segDurationsRaw = new Array(Math.max(0, n - 1));
   let rawDuration = 0;
   for (let i = 1; i < n; i++) {
     const ds = distances[i] - distances[i - 1];
-    const v = instSpeedRaw[i] > 0 ? instSpeedRaw[i] : avgSpeedTarget;
+    const v = instSpeedSmoothed[i] > 0 ? instSpeedSmoothed[i] : avgSpeedTarget;
     const dt = ds / v;
     segDurationsRaw[i - 1] = dt;
     rawDuration += dt;
@@ -126,7 +168,7 @@ function computeSamples(allPoints, distances, totalDist, paceSecondsPerKm, hrRes
   samples.push({
     timeSec: 0,
     distance: distances[0],
-    speed: instSpeedRaw[0] / scale,
+    speed: instSpeedSmoothed[0] / scale,
     heartRate: hrValues[0],
     lat: allPoints[0].lat,
     lng: allPoints[0].lng
@@ -138,7 +180,7 @@ function computeSamples(allPoints, distances, totalDist, paceSecondsPerKm, hrRes
     samples.push({
       timeSec: t,
       distance: distances[i],
-      speed: instSpeedRaw[i] / scale,
+      speed: instSpeedSmoothed[i] / scale,
       heartRate: hrValues[i],
       lat: allPoints[i].lat,
       lng: allPoints[i].lng
@@ -160,6 +202,7 @@ app.post("/api/preview", (req, res) => {
       paceSecondsPerKm,
       hrRest,
       hrMax,
+      hrRampMinutes,
       lapCount
     } = req.body || {};
 
@@ -177,16 +220,18 @@ app.post("/api/preview", (req, res) => {
     const pace = Number(paceSecondsPerKm) > 0 ? Number(paceSecondsPerKm) : 360;
     const hrRestVal = Number.isFinite(Number(hrRest)) ? Number(hrRest) : 60;
     const hrMaxVal = Number.isFinite(Number(hrMax)) ? Number(hrMax) : 180;
+    const hrRampMin = Number.isFinite(Number(hrRampMinutes)) && Number(hrRampMinutes) > 0 ? Number(hrRampMinutes) : 3;
     const lapsRaw = Number(lapCount);
     const laps = Number.isFinite(lapsRaw) && lapsRaw > 0 ? Math.floor(lapsRaw) : 1;
 
     const basePoints = buildClosedBasePoints(points);
+    const smoothBase = smoothInterpolatePoints(basePoints);
     const allPoints = [];
     const usedLaps = laps > 0 ? laps : 1;
 
     for (let lapIndex = 0; lapIndex < usedLaps; lapIndex++) {
-      for (let i = 0; i < basePoints.length; i++) {
-        const p = basePoints[i];
+      for (let i = 0; i < smoothBase.length; i++) {
+        const p = smoothBase[i];
         allPoints.push(p);
       }
     }
@@ -214,7 +259,8 @@ app.post("/api/preview", (req, res) => {
       totalDist,
       pace,
       hrRestVal,
-      hrMaxVal
+      hrMaxVal,
+      hrRampMin
     );
 
     return res.json({
@@ -236,6 +282,7 @@ app.post("/api/generate-fit", (req, res) => {
       paceSecondsPerKm,
       hrRest,
       hrMax,
+      hrRampMinutes,
       lapCount,
       variantIndex
     } = req.body || {};
@@ -254,6 +301,7 @@ app.post("/api/generate-fit", (req, res) => {
     const pace = Number(paceSecondsPerKm) > 0 ? Number(paceSecondsPerKm) : 360;
     const hrRestVal = Number.isFinite(Number(hrRest)) ? Number(hrRest) : 60;
     const hrMaxVal = Number.isFinite(Number(hrMax)) ? Number(hrMax) : 180;
+    const hrRampMin = Number.isFinite(Number(hrRampMinutes)) && Number(hrRampMinutes) > 0 ? Number(hrRampMinutes) : 3;
     const lapsRaw = Number(lapCount);
     const laps = Number.isFinite(lapsRaw) && lapsRaw > 0 ? Math.floor(lapsRaw) : 1;
     const variantRaw = Number(variantIndex);
@@ -263,21 +311,27 @@ app.post("/api/generate-fit", (req, res) => {
         : 1;
 
     const basePoints = buildClosedBasePoints(points);
+    const smoothBase = smoothInterpolatePoints(basePoints);
     const allPoints = [];
     const usedLaps = laps > 0 ? laps : 1;
 
     for (let lapIndex = 0; lapIndex < usedLaps; lapIndex++) {
-      const radiusMeters = 5 + Math.random() * 10;
-      const angle = Math.random() * Math.PI * 2;
-      const offsetLatMeters = radiusMeters * Math.cos(angle);
-      const offsetLonMeters = radiusMeters * Math.sin(angle);
-
-      for (let i = 0; i < basePoints.length; i++) {
-        const p = basePoints[i];
-        const noisyPoint =
-          usedLaps === 1
-            ? p
-            : offsetPointMeters(p, offsetLatMeters, offsetLonMeters);
+      // 逐点平滑随机游走抖动，模拟真实 GPS 噪声（每点独立，无整体平移）
+      let noiseX = 0, noiseY = 0;
+      for (let i = 0; i < smoothBase.length; i++) {
+        const p = smoothBase[i];
+        let noisyPoint;
+        if (usedLaps === 1) {
+          noisyPoint = p;
+        } else {
+          // 自回归随机游走：alpha=0.92 保证相邻点噪声相关（路径平滑）
+          noiseX = noiseX * 0.92 + (Math.random() - 0.5) * 0.7;
+          noiseY = noiseY * 0.92 + (Math.random() - 0.5) * 0.7;
+          // 限幅 ±2m，避免漂移过大
+          noiseX = Math.max(-2, Math.min(2, noiseX));
+          noiseY = Math.max(-2, Math.min(2, noiseY));
+          noisyPoint = offsetPointMeters(p, noiseX, noiseY);
+        }
         allPoints.push(noisyPoint);
       }
     }
@@ -305,7 +359,8 @@ app.post("/api/generate-fit", (req, res) => {
       totalDist,
       pace,
       hrRestVal,
-      hrMaxVal
+      hrMaxVal,
+      hrRampMin
     );
 
     const encoder = new Encoder();

@@ -19,6 +19,8 @@ let previewData = null;
 let previewTimer = null;
 let previewIndex = 0;
 let previewMarker = null;
+let trackTransform = null;      // { centerLat, centerLng, scale, angle }
+let trackHandleMarkers = [];    // [moveMarker, rotateMarker, scaleMarker]
 
 function updateMessage(text, isError = false) {
   const el = document.getElementById("message");
@@ -77,6 +79,7 @@ function updateDistanceInfo() {
 }
 
 map.on("click", (e) => {
+  if (trackTransform) return; // 操场变换模式下禁止手动添加点
   routePoints.push({ lat: e.latlng.lat, lng: e.latlng.lng });
   if (polyline) {
     polyline.setLatLngs(routePoints);
@@ -87,6 +90,147 @@ map.on("click", (e) => {
   updateDistanceInfo();
 });
 
+// ── 标准操场变换系统 ─────────────────────────────────────────
+const TRACK_STRAIGHT   = 84.39;
+const TRACK_RADIUS     = 36.5;
+const TRACK_EAST_DIST  = TRACK_STRAIGHT / 2 + TRACK_RADIUS; // 东端距中心 (m)
+const TRACK_NORTH_DIST = 75;  // 旋转把手距中心 (m)
+
+function makeHandleIcon(bg, text) {
+  return L.divIcon({
+    className: "",
+    html: `<div style="width:22px;height:22px;background:${bg};border:2px solid #fff;border-radius:50%;cursor:pointer;display:flex;align-items:center;justify-content:center;font-size:12px;color:#fff;font-weight:700;box-shadow:0 1px 5px rgba(0,0,0,.5)">${text}</div>`,
+    iconSize: [22, 22],
+    iconAnchor: [11, 11]
+  });
+}
+
+function trackMeters(centerLat) {
+  return { lat: 111320, lng: 111320 * Math.cos(centerLat * Math.PI / 180) };
+}
+
+// 从变换参数生成操场轨迹点（无抖动）
+function getTrackGeometry(centerLat, centerLng, scale, angle) {
+  const HALF_S = TRACK_STRAIGHT / 2;
+  const m = trackMeters(centerLat);
+  const cos = Math.cos(angle), sin = Math.sin(angle);
+  const pt = (x, y) => {
+    const sx = x * scale, sy = y * scale;
+    return {
+      lat: centerLat + (sx * sin + sy * cos) / m.lat,
+      lng: centerLng + (sx * cos - sy * sin) / m.lng
+    };
+  };
+  const NS = 20, NC = 24, pts = [];
+  for (let i = 0; i < NS; i++)
+    pts.push(pt(-HALF_S + TRACK_STRAIGHT * i / NS, -TRACK_RADIUS));
+  for (let i = 0; i <= NC; i++) {
+    const a = -Math.PI / 2 + Math.PI * i / NC;
+    pts.push(pt(HALF_S + TRACK_RADIUS * Math.cos(a), TRACK_RADIUS * Math.sin(a)));
+  }
+  for (let i = 1; i <= NS; i++)
+    pts.push(pt(HALF_S - TRACK_STRAIGHT * i / NS, TRACK_RADIUS));
+  for (let i = 1; i < NC; i++) {
+    const a = Math.PI / 2 + Math.PI * i / NC;
+    pts.push(pt(-HALF_S + TRACK_RADIUS * Math.cos(a), TRACK_RADIUS * Math.sin(a)));
+  }
+  // 闭合：回到起始点
+  pts.push({ lat: pts[0].lat, lng: pts[0].lng });
+  return pts;
+}
+
+// 旋转把手坐标（操场"正北"方向）
+function rotateHandleLatLng() {
+  const { centerLat, centerLng, scale, angle } = trackTransform;
+  const d = TRACK_NORTH_DIST * scale;
+  const m = trackMeters(centerLat);
+  return L.latLng(
+    centerLat + d * Math.cos(angle) / m.lat,
+    centerLng - d * Math.sin(angle) / m.lng
+  );
+}
+
+// 缩放把手坐标（操场"正东"端点）
+function scaleHandleLatLng() {
+  const { centerLat, centerLng, scale, angle } = trackTransform;
+  const d = TRACK_EAST_DIST * scale;
+  const m = trackMeters(centerLat);
+  return L.latLng(
+    centerLat + d * Math.sin(angle) / m.lat,
+    centerLng + d * Math.cos(angle) / m.lng
+  );
+}
+
+function redrawTrack() {
+  if (!trackTransform) return;
+  const { centerLat, centerLng, scale, angle } = trackTransform;
+  const pts = getTrackGeometry(centerLat, centerLng, scale, angle);
+  routePoints = pts;
+  if (polyline) map.removeLayer(polyline);
+  polyline = L.polygon(routePoints, { color: "#ff5722", fill: false, weight: 3 }).addTo(map);
+  if (trackHandleMarkers.length === 3) {
+    trackHandleMarkers[0].setLatLng([centerLat, centerLng]);
+    trackHandleMarkers[1].setLatLng(rotateHandleLatLng());
+    trackHandleMarkers[2].setLatLng(scaleHandleLatLng());
+  }
+  updateDistanceInfo();
+}
+
+function removeTrackHandles() {
+  trackHandleMarkers.forEach(m => map.removeLayer(m));
+  trackHandleMarkers = [];
+}
+
+function createTrackHandles() {
+  removeTrackHandles();
+  const { centerLat, centerLng } = trackTransform;
+
+  // ① 移动把手（蓝色，中心）
+  const moveMarker = L.marker([centerLat, centerLng], {
+    icon: makeHandleIcon("#1976d2", "✥"),
+    draggable: true, zIndexOffset: 1000
+  }).addTo(map);
+  moveMarker.on("drag", (e) => {
+    trackTransform.centerLat = e.latlng.lat;
+    trackTransform.centerLng = e.latlng.lng;
+    redrawTrack();
+  });
+
+  // ② 旋转把手（橙色，正北方向）
+  const rotMarker = L.marker(rotateHandleLatLng(), {
+    icon: makeHandleIcon("#f57c00", "↻"),
+    draggable: true, zIndexOffset: 1000
+  }).addTo(map);
+  rotMarker.on("drag", (e) => {
+    const { centerLat, centerLng } = trackTransform;
+    const m = trackMeters(centerLat);
+    const dx = (e.latlng.lng - centerLng) * m.lng;
+    const dy = (e.latlng.lat - centerLat) * m.lat;
+    // 北方向: dx=-d·sin(a), dy=d·cos(a) → a=atan2(-dx,dy)
+    trackTransform.angle = Math.atan2(-dx, dy);
+    redrawTrack();
+  });
+
+  // ③ 缩放把手（绿色，正东端点）
+  const scaleMarker = L.marker(scaleHandleLatLng(), {
+    icon: makeHandleIcon("#388e3c", "⤢"),
+    draggable: true, zIndexOffset: 1000
+  }).addTo(map);
+  scaleMarker.on("drag", (e) => {
+    const { centerLat, centerLng, angle } = trackTransform;
+    const m = trackMeters(centerLat);
+    const dx = (e.latlng.lng - centerLng) * m.lng;
+    const dy = (e.latlng.lat - centerLat) * m.lat;
+    // 投影到当前"东"方向
+    const projected = Math.cos(angle) * dx + Math.sin(angle) * dy;
+    trackTransform.scale = Math.max(0.3, Math.min(5, projected / TRACK_EAST_DIST));
+    redrawTrack();
+  });
+
+  trackHandleMarkers = [moveMarker, rotMarker, scaleMarker];
+}
+// ─────────────────────────────────────────────────────────────
+
 const clearBtn = document.getElementById("clearRoute");
 clearBtn.addEventListener("click", () => {
   routePoints = [];
@@ -94,9 +238,22 @@ clearBtn.addEventListener("click", () => {
     map.removeLayer(polyline);
     polyline = null;
   }
+  removeTrackHandles();
+  trackTransform = null;
   updateMessage("轨迹已清除");
   updateDistanceInfo();
 });
+
+const trackPresetBtn = document.getElementById("trackPreset");
+if (trackPresetBtn) {
+  trackPresetBtn.addEventListener("click", () => {
+    const center = map.getCenter();
+    trackTransform = { centerLat: center.lat, centerLng: center.lng, scale: 1, angle: 0 };
+    redrawTrack();
+    createTrackHandles();
+    updateMessage("已加载标准 400m 操场 — 拖动 ✥ 移动 · ↻ 旋转 · ⤢ 缩放");
+  });
+}
 
 function dateToLocalInputValue(d) {
   const tzOffset = d.getTimezoneOffset();
@@ -110,7 +267,10 @@ function rebuildExportTimes() {
   if (!container || !exportInput) return;
 
   const count = Math.max(1, Math.min(10, parseInt(exportInput.value, 10) || 1));
-  const now = new Date();
+
+  // 默认基准时间：今天晚上 20:30
+  const base = new Date();
+  base.setHours(20, 30, 0, 0);
 
   container.innerHTML = "";
 
@@ -125,7 +285,10 @@ function rebuildExportTimes() {
     timeInput.type = "datetime-local";
     timeInput.className = "export-time-input";
     timeInput.dataset.index = String(i);
-    const d = new Date(now.getTime() + i * 24 * 60 * 60 * 1000);
+
+    // 每份间隔一天，并叠加 ±10 分钟随机抖动（多份时生效）
+    const jitterMs = count > 1 ? (Math.random() - 0.5) * 2 * 10 * 60 * 1000 : 0;
+    const d = new Date(base.getTime() + i * 24 * 60 * 60 * 1000 + jitterMs);
     timeInput.value = dateToLocalInputValue(d);
 
     const paceMinInput = document.createElement("input");
@@ -159,6 +322,7 @@ async function generateFit() {
 
   const hrRest = parseInt(document.getElementById("hrRest").value, 10) || 60;
   const hrMax = parseInt(document.getElementById("hrMax").value, 10) || 180;
+  const hrRampMinutes = parseFloat(document.getElementById("hrRampMinutes")?.value) || 3;
 
   const lapInput = document.getElementById("lapCount");
   const exportInput = document.getElementById("exportCount");
@@ -223,6 +387,7 @@ async function generateFit() {
           paceSecondsPerKm: filePaceSecondsPerKm,
           hrRest,
           hrMax,
+          hrRampMinutes,
           lapCount,
           variantIndex: i + 1
         })
@@ -294,7 +459,7 @@ function renderPreviewCharts(preview) {
           label: "配速 (min/km)",
           data: paceData,
           borderColor: "#1976d2",
-          tension: 0.2,
+          tension: 0.4,
           pointRadius: 0
         }
       ]
@@ -325,7 +490,7 @@ function renderPreviewCharts(preview) {
           label: "心率 (bpm)",
           data: hrData,
           borderColor: "#e53935",
-          tension: 0.2,
+          tension: 0.4,
           pointRadius: 0
         }
       ]
@@ -393,6 +558,7 @@ async function previewActivity() {
 
   const hrRest = parseInt(document.getElementById("hrRest").value, 10) || 60;
   const hrMax = parseInt(document.getElementById("hrMax").value, 10) || 180;
+  const hrRampMinutes = parseFloat(document.getElementById("hrRampMinutes")?.value) || 3;
 
   const lapInput = document.getElementById("lapCount");
   const lapCount = Math.max(1, parseInt(lapInput?.value, 10) || 1);
@@ -409,6 +575,7 @@ async function previewActivity() {
         paceSecondsPerKm,
         hrRest,
         hrMax,
+        hrRampMinutes,
         lapCount
       })
     });

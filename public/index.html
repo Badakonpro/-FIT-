@@ -24,6 +24,10 @@
           <input id="hrMax" type="number" min="100" max="220" value="180" />
         </div>
         <div class="form-group">
+          <label for="hrRampMinutes">心率达峰时间（分钟）</label>
+          <input id="hrRampMinutes" type="number" min="0.5" max="30" step="0.5" value="3" />
+        </div>
+        <div class="form-group">
           <label for="lapCount">圈数（重复次数）</label>
           <input id="lapCount" type="number" min="1" value="1" />
         </div>
@@ -35,6 +39,7 @@
         <div id="distanceInfo" class="distance-info"></div>
         <div class="form-group buttons">
           <button id="clearRoute" type="button">清除轨迹</button>
+          <button id="trackPreset" type="button">标准操场</button>
           <button id="previewBtn" type="button">预览曲线</button>
           <button id="generateFit" type="button">生成 FIT 文件</button>
         </div>
